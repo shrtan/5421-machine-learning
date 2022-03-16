@@ -1,0 +1,385 @@
+---
+title: "Homework 2"
+author: "Shreya Rao"
+date: "3/7/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Preprocessing
+
+```{r setup, include=FALSE}
+# this prevents package loading message from appearing in the rendered version 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+# load packages
+library(keras)  #https://keras.rstudio.com/
+library(MESS) # calculate auc
+library(latex2exp)
+library(ggplot2)
+library(RcppCNPy)
+#install_keras() 
+library(reticulate) 
+library(tensorflow)
+library(glmnet)
+library(tidyverse)
+library(caret)
+library(plotly)
+
+# install.packages("Rcpp") 
+# install.packages("jsonlite") 
+# install.packages("curl")
+# devtools::install_github("rstudio/reticulate") 
+# devtools::install_github("rstudio/tensorflow") 
+# devtools::install_github("rstudio/keras")
+```
+
+```{r, cache=T}
+p = 2500
+imdb = dataset_imdb(num_words = p, skip_top = 00) #, skip_top = 10
+train_data = imdb$train$x
+train_labels = imdb$train$y
+test_data = imdb$test$x
+test_labels = imdb$test$y
+
+numberWords.train = max(sapply(train_data, max))
+numberWords.test = max(sapply(test_data, max))
+```
+
+```{r}
+word_index = dataset_imdb_word_index() #word_index is a named list mapping words to an integer index
+reverse_word_index = names(word_index) # Reverses it, mapping integer indices to words
+names(reverse_word_index) = word_index
+
+index.to.review <- function(index) {
+  decoded_review <- sapply(train_data[[index]], function(index) {
+    word <- if (index >= 3) reverse_word_index[[as.character(index - 3)]]
+    if (!is.null(word)) word else "?"
+  }) 
+  return(decoded_review)
+}
+```
+
+```{r}
+vectorize_sequences <- function(sequences, dimension = p) {
+  results <- matrix(0, nrow = length(sequences), ncol = dimension)
+  for (i in 1:length(sequences))
+    results[i, sequences[[i]]] <- 1
+  results
+}
+
+X.train = vectorize_sequences(train_data)
+X.test = vectorize_sequences(test_data)
+
+
+train.P.index = which(train_labels==1) 
+train.P.index = train.P.index[1:4000]
+train.N.index = which(train_labels==0)
+
+test.P.index = which(test_labels==1)
+test.P.index = test.P.index[1:4000]
+test.N.index = which(test_labels==0) 
+
+train.indx = c(train.P.index, train.N.index)
+X.train = X.train[train.indx, ]
+test.indx = c(test.P.index, test.N.index)
+X.test = X.test[test.indx, ]
+
+#str(X.train[1,])
+y.train = as.numeric(train_labels)
+y.train = y.train[train.indx]
+n.train = length(y.train)
+y.test = as.numeric(test_labels)
+y.test = y.test[test.indx]
+n.test = length(y.test)
+```
+
+
+# 1. Lasso Logistic Regression
+```{r, cache=T}
+lasso_cv <- cv.glmnet(X.train, y.train, family = "binomial", alpha = 1, nfolds = 10, type.measure="auc")
+```
+
+```{r}
+lasso_lambda <- lasso_cv$lambda.min
+#lasso_lambda <- 0.01
+fit_lasso = glmnet(X.train, y.train, alpha = 1, lambda = lasso_lambda, family = "binomial") 
+
+betas_lasso <- fit_lasso$beta
+betas_names <- row.names(betas_lasso)
+betas_lasso <- betas_lasso %>% as.vector() %>% as.tibble()
+betas_lasso$index <- betas_names
+```
+
+```{r}
+#creating my dictionary
+my_word_index <- reverse_word_index %>% as.data.frame() %>% rownames_to_column()
+colnames(my_word_index) <- c("index", "word")
+
+#function that matches index to word
+word_finder <- function(x) {
+  num <- as.numeric(substr(x, 2, nchar(x)))
+  i <- which(num == my_word_index$index)
+  return(my_word_index$word[i])
+}
+```
+
+**i.  Top 5 words associated with positive reviews**
+```{r}
+#finding the greatest betas
+positive_words <- betas_lasso %>% slice_max(value, n=5)
+cat("Top 5 words associated with positive reviews are:\n", sapply(positive_words$index, word_finder))
+```
+
+**ii.  Top 5 words associated with negative reviews**
+```{r}
+#finding the greatest betas
+negative_words <- betas_lasso %>% slice_min(value, n=5)
+cat("Top 5 words associated with negative reviews are:\n", sapply(negative_words$index, word_finder))
+```
+
+**iii. ROC and AUC**
+```{r}
+thetas <- seq(0, 1, by = 0.01)
+
+roc_lasso <- data.frame(theta = thetas, TPR_train = rep(NA, length(thetas)), FPR_train = rep(NA, length(thetas)), TPR_test = rep(NA, length(thetas)), FPR_test = rep(NA, length(thetas)))
+
+for (i in 1:length(thetas)) {
+  #train prediction label - 1 or 0
+  pred_lasso_train <- as.factor(ifelse(predict(fit_lasso, X.train, type="response") > thetas[i], "1", "0"))
+  #train confusion matrix
+  cm_train <- confusionMatrix(pred_lasso_train, as.factor(y.train))
+  #train TPR and FPR
+  roc_lasso$TPR_train[i] <- cm_train$table[4]/(cm_train$table[4]+cm_train$table[3])
+  roc_lasso$FPR_train[i] <- cm_train$table[2]/(cm_train$table[2]+cm_train$table[1])
+  
+  #test prediction label - 1 or 0
+  pred_lasso_test <- as.factor(ifelse(predict(fit_lasso, X.test, type="response") > thetas[i], "1", "0"))
+  #test confusion matrix
+  cm_test <- confusionMatrix(pred_lasso_test, as.factor(y.test))
+  #test TPR and FPR
+  roc_lasso$TPR_test[i] <- cm_test$table[4]/(cm_test$table[4]+cm_test$table[3])
+  roc_lasso$FPR_test[i] <- cm_test$table[2]/(cm_test$table[2]+cm_test$table[1])
+}
+
+#auc values
+train_auc_lasso <- auc(roc_lasso$FPR_train, roc_lasso$TPR_train, type = 'spline')
+test_auc_lasso <- auc(roc_lasso$FPR_test, roc_lasso$TPR_test, type = 'spline')
+
+roc_lasso_plot <- data.frame(TPR = stack(roc_lasso[c(2, 4)])$values, FPR = stack(roc_lasso[c(3, 5)])$values, Type = c(rep("Training", nrow(roc_lasso)), rep("Testing", nrow(roc_lasso))))
+
+#plotting roc curve
+roc_lasso_plot %>%
+  ggplot(aes(x=FPR, y=TPR, color=Type)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(a=0, b=1, linetype = "dashed") +
+  theme_light() +
+  ylab("True Positive Rate") + xlab("False Positive Rate") +
+  labs(color = "")
+
+
+# plot_ly() %>%
+#   add_lines(x = roc_lasso$FPR_train, y = roc_lasso$TPR_train, color = I("blue"), name = paste("Train\n", "AUC = ", as.character(round(train_auc_lasso, 3)), sep = " ", collapse = NULL)) %>%
+#   add_lines(x = roc_lasso$FPR_test, y = roc_lasso$TPR_test, color = I("red"), name = paste("Test\n", "AUC = ", as.character(round(test_auc_lasso, 3)), sep = " ", collapse = NULL)) %>%
+#   layout(legend = list(x = 100, y = 0.5), yaxis = list(title = 'True Positive Rate'), xaxis = list(title = 'False Positive Rate')) %>%
+#   add_trace(x = thetas, y = thetas, type = "scatter", mode="lines", color = I("black"), line = list(dash="dot"), name="Baseline")
+```
+
+
+**iv. Training and testing type I and type II error for theta = 0.5**
+```{r}
+#type 1 - fpr, type 2 - 1-tpr
+index <- which(thetas == 0.5)
+
+cat("Training Type I Error: ", as.character(roc_lasso$FPR_train[index]), "\nTraining Type II Error: ", as.character(1-roc_lasso$TPR_train[index]), "\nTesting Type I Error: ", as.character(roc_lasso$FPR_test[index]), "\nTesting Type II Error: ", as.character(1-roc_lasso$TPR_test[index]))
+```
+
+
+**v. Training type I error is equal (as much as possible) to the type II error**
+```{r}
+roc_lasso <- roc_lasso %>% mutate(diff = FPR_train+TPR_train-1)
+cat("Training Type I error is closest to Type II error for: theta = ", thetas[which(abs(roc_lasso$diff) == min(abs(roc_lasso$diff)))])
+```
+
+
+# 2. Ridge Logistic Regression
+```{r, cache=T}
+ridge_cv <- cv.glmnet(X.train, y.train, family = "binomial", alpha = 0, nfolds = 10, type.measure="auc")
+```
+
+```{r}
+ridge_lambda <- ridge_cv$lambda.min
+#ridge_lambda <- 0.02
+fit_ridge = glmnet(X.train, y.train, alpha = 0, lambda = ridge_lambda, family = "binomial") 
+
+betas_ridge <- fit_ridge$beta
+betas_names <- row.names(betas_ridge)
+betas_ridge <- betas_ridge %>% as.vector() %>% as.tibble()
+betas_ridge$index <- betas_names
+```
+
+
+**i.  Top 5 words associated with positive reviews**
+```{r}
+#finding the greatest betas
+positive_words <- betas_ridge %>% slice_max(value, n=5)
+cat("Top 5 words associated with positive reviews are:\n", sapply(positive_words$index, word_finder))
+```
+
+
+**ii.  Top 5 words associated with negative reviews**
+```{r}
+#finding the greatest betas
+negative_words <- betas_ridge %>% slice_min(value, n=5)
+cat("Top 5 words associated with negative reviews are:\n", sapply(negative_words$index, word_finder))
+```
+
+
+**iii. ROC and AUC**
+```{r}
+thetas <- seq(0, 1, by = 0.01)
+
+roc_ridge <- data.frame(theta = thetas, TPR_train = rep(NA, length(thetas)), FPR_train = rep(NA, length(thetas)), TPR_test = rep(NA, length(thetas)), FPR_test = rep(NA, length(thetas)))
+
+for (i in 1:length(thetas)) {
+  #train prediction label - 1 or 0
+  pred_ridge_train <- as.factor(ifelse(predict(fit_ridge, X.train, type="response") > thetas[i], "1", "0"))
+  #train confusion matrix
+  cm_train <- confusionMatrix(pred_ridge_train, as.factor(y.train))
+  #train TPR and FPR
+  roc_ridge$TPR_train[i] <- cm_train$table[4]/(cm_train$table[4]+cm_train$table[3])
+  roc_ridge$FPR_train[i] <- cm_train$table[2]/(cm_train$table[2]+cm_train$table[1])
+  
+  #test prediction label - 1 or 0
+  pred_ridge_test <- as.factor(ifelse(predict(fit_ridge, X.test, type="response") > thetas[i], "1", "0"))
+  #test confusion matrix
+  cm_test <- confusionMatrix(pred_ridge_test, as.factor(y.test))
+  #test TPR and FPR
+  roc_ridge$TPR_test[i] <- cm_test$table[4]/(cm_test$table[4]+cm_test$table[3])
+  roc_ridge$FPR_test[i] <- cm_test$table[2]/(cm_test$table[2]+cm_test$table[1])
+}
+
+#auc
+train_auc_ridge <- auc(roc_ridge$FPR_train, roc_ridge$TPR_train, type = 'spline')
+test_auc_ridge <- auc(roc_ridge$FPR_test, roc_ridge$TPR_test, type = 'spline')
+
+roc_ridge_plot <- data.frame(TPR = stack(roc_ridge[c(2, 4)])$values, FPR = stack(roc_ridge[c(3, 5)])$values, Type = c(rep("Training", nrow(roc_ridge)), rep("Testing", nrow(roc_ridge))))
+
+#plotting roc curve
+roc_ridge_plot %>%
+  ggplot(aes(x=FPR, y=TPR, color=Type)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(a=0, b=1, linetype = "dashed") +
+  theme_light() +
+  ylab("True Positive Rate") + xlab("False Positive Rate") +
+  labs(color = "")
+```
+
+
+**iv. Training and testing type I and type II error for theta = 0.5**
+```{r}
+#type 1 - fpr, type 2 - 1-tpr
+index <- which(thetas == 0.5)
+
+cat("Training Type I Error: ", as.character(roc_ridge$FPR_train[index]), "\nTraining Type II Error: ", as.character(1-roc_ridge$TPR_train[index]), "\nTesting Type I Error: ", as.character(roc_ridge$FPR_test[index]), "\nTesting Type II Error: ", as.character(1-roc_ridge$TPR_test[index]))
+```
+
+
+**v. Training type I error is equal (as much as possible) to the type II error**
+```{r}
+roc_ridge <- roc_ridge %>% mutate(diff = FPR_train+TPR_train-1)
+cat("Training Type I error is closest to Type II error for: theta = ", thetas[which(abs(roc_ridge$diff) == min(abs(roc_ridge$diff)))])
+```
+
+
+# 3. Elastic-Net Logistic Regression
+```{r, cache=T}
+eln_cv <- cv.glmnet(X.train, y.train, family = "binomial", alpha = 0.5, nfolds = 10, type.measure="auc")
+```
+
+```{r}
+eln_lambda <- eln_cv$lambda.min
+#eln_lambda <- 0.01
+fit_eln = glmnet(X.train, y.train, alpha = 0.5, lambda = eln_lambda, family = "binomial") 
+
+betas_eln <- fit_eln$beta
+betas_names <- row.names(betas_eln)
+betas_eln <- betas_eln %>% as.vector() %>% as.tibble()
+betas_eln$index <- betas_names
+```
+
+
+**i.  Top 5 words associated with positive reviews**
+```{r}
+#finding the greatest betas
+positive_words <- betas_eln %>% slice_max(value, n=5)
+cat("Top 5 words associated with positive reviews are:\n", sapply(positive_words$index, word_finder))
+```
+
+
+**ii.  Top 5 words associated with negative reviews**
+```{r}
+#finding the greatest betas
+negative_words <- betas_eln %>% slice_min(value, n=5)
+cat("Top 5 words associated with negative reviews are:\n", sapply(negative_words$index, word_finder))
+```
+
+
+**iii. ROC and AUC**
+```{r}
+thetas <- seq(0, 1, by = 0.01)
+
+roc_eln <- data.frame(theta = thetas, TPR_train = rep(NA, length(thetas)), FPR_train = rep(NA, length(thetas)), TPR_test = rep(NA, length(thetas)), FPR_test = rep(NA, length(thetas)))
+
+for (i in 1:length(thetas)) {
+  #train prediction label - 1 or 0
+  pred_eln_train <- as.factor(ifelse(predict(fit_eln, X.train, type="response") > thetas[i], "1", "0"))
+  #train confusion matrix
+  cm_train <- confusionMatrix(pred_eln_train, as.factor(y.train))
+  #train TPR and FPR
+  roc_eln$TPR_train[i] <- cm_train$table[4]/(cm_train$table[4]+cm_train$table[3])
+  roc_eln$FPR_train[i] <- cm_train$table[2]/(cm_train$table[2]+cm_train$table[1])
+  
+  #test prediction label - 1 or 0
+  pred_eln_test <- as.factor(ifelse(predict(fit_eln, X.test, type="response") > thetas[i], "1", "0"))
+  #test confusion matrix
+  cm_test <- confusionMatrix(pred_eln_test, as.factor(y.test))
+  #test TPR and FPR
+  roc_eln$TPR_test[i] <- cm_test$table[4]/(cm_test$table[4]+cm_test$table[3])
+  roc_eln$FPR_test[i] <- cm_test$table[2]/(cm_test$table[2]+cm_test$table[1])
+}
+
+roc_eln_plot <- data.frame(TPR = stack(roc_eln[c(2, 4)])$values, FPR = stack(roc_eln[c(3, 5)])$values, Type = c(rep("Training", nrow(roc_eln)), rep("Testing", nrow(roc_eln))))
+
+#plotting roc curve
+roc_eln_plot %>%
+  ggplot(aes(x=FPR, y=TPR, color=Type)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(a=0, b=1, linetype = "dashed") +
+  theme_light() +
+  ylab("True Positive Rate") + xlab("False Positive Rate") +
+  labs(color = "")
+```
+
+
+**iv. Training and testing type I and type II error for theta = 0.5**
+```{r}
+#type 1 - fpr, type 2 - 1-tpr
+index <- which(thetas == 0.5)
+
+cat("Training Type I Error: ", as.character(roc_eln$FPR_train[index]), "\nTraining Type II Error: ", as.character(1-roc_eln$TPR_train[index]), "\nTesting Type I Error: ", as.character(roc_eln$FPR_test[index]), "\nTesting Type II Error: ", as.character(1-roc_eln$TPR_test[index]))
+```
+
+
+**v. Training type I error is equal (as much as possible) to the type II error**
+```{r}
+roc_eln <- roc_eln %>% mutate(diff = FPR_train+TPR_train-1)
+cat("Training Type I error is closest to Type II error for: theta = ", thetas[which(abs(roc_eln$diff) == min(abs(roc_eln$diff)))])
+```
